@@ -16,8 +16,9 @@ ASPECT_RATIOS: dict = {
     '9:21': (640, 1536),
 }
 
+
 class AspectRatioRandomizer(scripts.Script):
-    sorting_priority = 1
+    sorting_priority = 17
     
     def title(self):
         return "AR Randomizer"
