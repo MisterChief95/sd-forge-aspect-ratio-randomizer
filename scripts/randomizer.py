@@ -8,19 +8,24 @@ from backend import memory_management
 from modules.sd_models import model_data, select_checkpoint
 import modules.shared as shared
 from modules import errors, scripts
-from modules.processing import Processed, StableDiffusionProcessingTxt2Img, fix_seed, process_images
+from modules.processing import (
+    Processed,
+    StableDiffusionProcessingTxt2Img,
+    fix_seed,
+    process_images,
+)
 
 
 ASPECT_RATIOS: dict = {
-    '21:9': (21, 9),
-    '16:9': (16, 9),
-    '3:2': (3, 2),
-    '4:3': (4, 3),
-    '1:1': (1, 1),
-    '2:3': (2, 3),
-    '3:4': (3, 4),
-    '9:16': (9, 16),
-    '9:21': (9, 21),
+    "21:9": (21, 9),
+    "16:9": (16, 9),
+    "3:2": (3, 2),
+    "4:3": (4, 3),
+    "1:1": (1, 1),
+    "2:3": (2, 3),
+    "3:4": (3, 4),
+    "9:16": (9, 16),
+    "9:21": (9, 21),
 }
 
 
@@ -29,50 +34,51 @@ def calc_nearest_res_for_ratio(width: int, ratio: tuple[int, int]) -> tuple[int,
         return width, width
 
     base_area = width * width
-    ratio = (ratio[0] / ratio[1])
+    ratio = ratio[0] / ratio[1]
 
     if ratio >= 1:
         # Scale width for positive ratios
         new_width = int(math.sqrt(base_area * ratio))
         new_height = int(new_width / ratio)
     else:
-        # Scale height for negative ratios 
+        # Scale height for negative ratios
         new_height = int(math.sqrt(base_area / ratio))
         new_width = int(new_height * ratio)
 
     new_width = round(float(new_width) / 64) * 64
     new_height = round(float(new_height) / 64) * 64
-    
+
     return new_width, new_height
 
 
 print("Aspect Ratio Randomizer Loaded")
 
-class AspectRatioRandomizer(scripts.Script):
 
+class AspectRatioRandomizer(scripts.Script):
     def __init__(self):
         self.seed_to_ratio: dict[int, tuple[int, int]] = {}
 
     def title(self):
         return "Aspect Ratio Randomizer"
-    
+
     def ui(self, is_img2img):
         if is_img2img:
             return
 
         with gr.Row():
-            ratios = gr.CheckboxGroup(label="Aspect Ratios", choices=ASPECT_RATIOS.keys())
+            ratios = gr.CheckboxGroup(
+                label="Aspect Ratios", choices=ASPECT_RATIOS.keys()
+            )
 
         return [ratios]
-    
 
     def run(self, p: StableDiffusionProcessingTxt2Img, ratios):
-        if hasattr(p, 'txt2img_upscale') and p.txt2img_upscale:
+        if hasattr(p, "txt2img_upscale") and p.txt2img_upscale:
             return process_images(p)
 
         if not ratios:
             raise ValueError("Please select at least one aspect ratio")
-        
+
         fix_seed(p)
 
         original_width = p.width
@@ -93,11 +99,12 @@ class AspectRatioRandomizer(scripts.Script):
                 processing_objects.append(p_copy)
 
         selected_ratios = [ASPECT_RATIOS[ratio] for ratio in ratios]
-        
+
         for pc in processing_objects:
             pc.width, pc.height = calc_nearest_res_for_ratio(
-                original_width, random.choice(selected_ratios))
-        
+                original_width, random.choice(selected_ratios)
+            )
+
         hr_steps = p.hr_second_pass_steps if p.enable_hr else 0
         total_steps = len(processing_objects) * (p.steps + hr_steps)
 
@@ -146,8 +153,10 @@ class AspectRatioRandomizer(scripts.Script):
         model_data.forge_loading_parameters = dict(
             checkpoint_info=checkpoint_info,
             additional_modules=shared.opts.forge_additional_modules,
-            #unet_storage_dtype=shared.opts.forge_unet_storage_dtype
-            unet_storage_dtype=model_data.forge_loading_parameters.get('unet_storage_dtype', None)
+            # unet_storage_dtype=shared.opts.forge_unet_storage_dtype
+            unet_storage_dtype=model_data.forge_loading_parameters.get(
+                "unet_storage_dtype", None
+            ),
         )
 
         return processed_result
