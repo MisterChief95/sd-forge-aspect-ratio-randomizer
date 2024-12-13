@@ -50,6 +50,7 @@ def calc_nearest_res_for_ratio(width: int, ratio: tuple[int, int]) -> tuple[int,
 
     return new_width, new_height
 
+
 # TODO: Add settings options to allow users to add custom aspect ratios
 class AspectRatioRandomizer(scripts.Script):
     def __init__(self):
@@ -60,14 +61,16 @@ class AspectRatioRandomizer(scripts.Script):
 
     def ui(self, is_img2img):
         if is_img2img:
-            gr.Markdown("This script is only available for text-to-image tasks. Please switch to Txt2Img tab to use this script.")
+            gr.Markdown(
+                "This script is only available for text-to-image tasks. Please switch to Txt2Img tab to use this script."
+            )
             return
 
         selector_mode = gr.Radio(
-            value="Seed", 
-            choices=["Seed", "Random"], 
+            value="Seed",
+            choices=["Seed", "Random"],
             label="Ratio Selection Mode",
-            info="Select whether to randomize aspect ratios based on seed or randomly"
+            info="Select whether to randomize aspect ratios based on seed or randomly",
         )
 
         ratios = gr.CheckboxGroup(
@@ -168,5 +171,6 @@ class AspectRatioRandomizer(scripts.Script):
         )
 
         return processed_result
+
 
 print("Aspect Ratio Randomizer Loaded")
