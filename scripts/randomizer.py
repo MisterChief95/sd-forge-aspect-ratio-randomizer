@@ -22,8 +22,8 @@ ASPECT_RATIOS: dict = {
     "3:2": (3, 2),
     "4:3": (4, 3),
     "1:1": (1, 1),
-    "2:3": (2, 3),
     "3:4": (3, 4),
+    "2:3": (2, 3),
     "9:16": (9, 16),
     "9:21": (9, 21),
 }
@@ -36,7 +36,7 @@ def calc_nearest_res_for_ratio(width: int, ratio: tuple[int, int]) -> tuple[int,
     base_area = width * width
     ratio = ratio[0] / ratio[1]
 
-    if ratio >= 1:
+    if ratio > 1:
         # Scale width for positive ratios
         new_width = int(math.sqrt(base_area * ratio))
         new_height = int(new_width / ratio)
@@ -51,9 +51,6 @@ def calc_nearest_res_for_ratio(width: int, ratio: tuple[int, int]) -> tuple[int,
     return new_width, new_height
 
 
-print("Aspect Ratio Randomizer Loaded")
-
-
 class AspectRatioRandomizer(scripts.Script):
     def __init__(self):
         self.seed_to_ratio: dict[int, tuple[int, int]] = {}
@@ -66,13 +63,24 @@ class AspectRatioRandomizer(scripts.Script):
             return
 
         with gr.Row():
-            ratios = gr.CheckboxGroup(
-                label="Aspect Ratios", choices=ASPECT_RATIOS.keys()
+            selector_mode = gr.Radio(
+                value="Seed", 
+                choices=["Seed", "Random"], 
+                label="Ratio Selection Mode",
+                info="Select whether to randomize aspect ratios based on seed or randomly"
             )
 
-        return [ratios]
+            with gr.Group():
+                ratios = gr.HTML("Left: Wider, Center: Square, Right: Taller")
+                ratios = gr.CheckboxGroup(
+                    label="Aspect Ratios",
+                    choices=ASPECT_RATIOS.keys(),
+                    info="Select the aspect ratios you want to randomize between",
+                )
 
-    def run(self, p: StableDiffusionProcessingTxt2Img, ratios):
+        return [selector_mode, ratios]
+
+    def run(self, p: StableDiffusionProcessingTxt2Img, selector_mode, ratios):
         if hasattr(p, "txt2img_upscale") and p.txt2img_upscale:
             return process_images(p)
 
@@ -101,9 +109,11 @@ class AspectRatioRandomizer(scripts.Script):
         selected_ratios = [ASPECT_RATIOS[ratio] for ratio in ratios]
 
         for pc in processing_objects:
-            pc.width, pc.height = calc_nearest_res_for_ratio(
-                original_width, random.choice(selected_ratios)
-            )
+            if selector_mode == "Seed":
+                ratio = selected_ratios[pc.seed % len(selected_ratios)]
+            else:
+                ratio = random.choice(selected_ratios)
+            pc.width, pc.height = calc_nearest_res_for_ratio(original_width, ratio)
 
         hr_steps = p.hr_second_pass_steps if p.enable_hr else 0
         total_steps = len(processing_objects) * (p.steps + hr_steps)
@@ -160,3 +170,5 @@ class AspectRatioRandomizer(scripts.Script):
         )
 
         return processed_result
+
+print("Aspect Ratio Randomizer Loaded")
