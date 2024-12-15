@@ -1,12 +1,15 @@
 import math
 import random
 import copy
+from dataclasses import dataclass
+from functools import cached_property
 
 import gradio as gr
 
 from backend import memory_management
-from modules.sd_models import model_data, select_checkpoint
+
 import modules.shared as shared
+from modules.sd_models import model_data, select_checkpoint
 from modules import errors, scripts
 from modules.processing import (
     Processed,
@@ -16,45 +19,93 @@ from modules.processing import (
 )
 
 
-ASPECT_RATIOS: dict = {
-    "21:9": (21, 9),
-    "16:9": (16, 9),
-    "3:2": (3, 2),
-    "4:3": (4, 3),
-    "1:1": (1, 1),
-    "3:4": (3, 4),
-    "2:3": (2, 3),
-    "9:16": (9, 16),
-    "9:21": (9, 21),
-}
+DEFAULT_ASPECT_RATIOS: list[str] = ["21:9", "16:9", "3:2", "4:3", "1:1"]
 
 
-def calc_nearest_res_for_ratio(width: int, ratio: tuple[int, int]) -> tuple[int, int]:
-    if ratio[0] == ratio[1]:
-        return width, width
+@dataclass
+class AspectRatio:
+    antecedent: int
+    consequent: int
+
+    @cached_property
+    def ratio(self) -> float:
+        return self.antecedent / self.consequent
+
+
+@dataclass
+class Size:
+    width: int
+    height: int
+
+    def __iter__(self):
+        yield self.width
+        yield self.height
+
+
+def calc_nearest_res_for_ratio(width: int, aspectRatio: AspectRatio) -> Size:
+    if aspectRatio.ratio == 1:
+        return Size(width, width)
 
     base_area = width * width
-    ratio = ratio[0] / ratio[1]
 
-    if ratio > 1:
+    if aspectRatio.ratio > 1:
         # Scale width for positive ratios
-        new_width = int(math.sqrt(base_area * ratio))
-        new_height = int(new_width / ratio)
+        new_width = int(math.sqrt(base_area * aspectRatio.ratio))
+        new_height = int(new_width / aspectRatio.ratio)
     else:
         # Scale height for negative ratios
-        new_height = int(math.sqrt(base_area / ratio))
-        new_width = int(new_height * ratio)
+        new_height = int(math.sqrt(base_area / aspectRatio.ratio))
+        new_width = int(new_height * aspectRatio.ratio)
 
-    new_width = round(float(new_width) / 64) * 64
-    new_height = round(float(new_height) / 64) * 64
+    pixel_rounding: float = max(1, shared.opts.data.get("arr_round_to", 64))
 
-    return new_width, new_height
+    new_width = int(round(float(new_width) / pixel_rounding) * pixel_rounding)
+    new_height = int(round(float(new_height) / pixel_rounding) * pixel_rounding)
+
+    return Size(new_width, new_height)
+
+
+def parse_aspect_ratio(ratio: str) -> tuple[str, AspectRatio]:
+    ratio = ratio.replace(" ", "")
+    antecedent, consequent = map(int, ratio.split(":"))
+    key = f"{antecedent}:{consequent}"
+
+    return key, AspectRatio(antecedent, consequent)
+
+
+def reverse_ratio(ratio: str) -> str:
+    antecedent, consequent = ratio.split(":")
+    return f"{consequent}:{antecedent}"
+
+
+def get_expanded_aspect_ratios() -> dict[str, AspectRatio]:
+    custom_ratios = (
+        (shared.opts.data.get("arr_custom_ratios", "") or "").strip().split(",")
+    )
+    custom_ratios = [
+        ar.strip()
+        for ar in custom_ratios
+        if ":" in ar and ar.replace(":", "").isdigit()
+    ]
+    all_ratios = DEFAULT_ASPECT_RATIOS + custom_ratios
+    expanded_ratios = all_ratios + [reverse_ratio(ratio) for ratio in all_ratios]
+
+    return dict(
+        sorted(
+            [parse_aspect_ratio(ar) for ar in expanded_ratios],
+            key=lambda item: item[1].ratio,
+            reverse=True,
+        )
+    )
+
+
+ASPECT_RATIOS: dict[str, AspectRatio] = get_expanded_aspect_ratios()
 
 
 # TODO: Add settings options to allow users to add custom aspect ratios
 class AspectRatioRandomizer(scripts.Script):
     def __init__(self):
-        self.seed_to_ratio: dict[int, tuple[int, int]] = {}
+        self.seed_to_ratio: dict[int, AspectRatio] = {}
 
     def title(self):
         return "Aspect Ratio Randomizer"
@@ -66,27 +117,39 @@ class AspectRatioRandomizer(scripts.Script):
             )
             return
 
-        selector_mode = gr.Radio(
-            value="Seed",
-            choices=["Seed", "Random"],
-            label="Ratio Selection Mode",
-            info="Select whether to randomize aspect ratios based on seed or randomly",
+        with gr.Row():
+            ratios = gr.CheckboxGroup(
+                label="Aspect Ratios",
+                choices=list(ASPECT_RATIOS.keys()),
+                info="Select the aspect ratios you want to randomize between. Order is: Wide - Square - Tall",
+            )
+
+        gr.HTML("<br>")
+
+        with gr.Row():
+            select_all = gr.Button(value="Select All")
+            select_none = gr.Button(value="Select None")
+
+        select_all.click(
+            lambda _: gr.CheckboxGroup(value=list(ASPECT_RATIOS.keys())),
+            inputs=[ratios],
+            outputs=[ratios],
+        )
+        select_none.click(
+            lambda _: gr.CheckboxGroup(value=[]), inputs=[ratios], outputs=[ratios]
         )
 
-        ratios = gr.CheckboxGroup(
-            label="Aspect Ratios",
-            choices=ASPECT_RATIOS.keys(),
-            info="Select the aspect ratios you want to randomize between. Order is: Wider -> Squarer -> Taller",
-        )
+        return [ratios]
 
-        return [selector_mode, ratios]
-
-    def run(self, p: StableDiffusionProcessingTxt2Img, selector_mode, ratios):
+    def run(self, p: StableDiffusionProcessingTxt2Img, ratios):
+        # Skip randomization if quick upscaling
         if hasattr(p, "txt2img_upscale") and p.txt2img_upscale:
             return process_images(p)
 
         if not ratios:
-            raise ValueError("Please select at least one aspect ratio")
+            raise ValueError(
+                "[Aspect Ratio Randomizer] Please select at least one aspect ratio"
+            )
 
         fix_seed(p)
 
@@ -110,10 +173,7 @@ class AspectRatioRandomizer(scripts.Script):
         selected_ratios = [ASPECT_RATIOS[ratio] for ratio in ratios]
 
         for pc in processing_objects:
-            if selector_mode == "Seed":
-                ratio = selected_ratios[pc.seed % len(selected_ratios)]
-            else:
-                ratio = random.choice(selected_ratios)
+            ratio = random.choice(selected_ratios)
             pc.width, pc.height = calc_nearest_res_for_ratio(original_width, ratio)
 
         hr_steps = p.hr_second_pass_steps if p.enable_hr else 0
