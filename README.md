@@ -6,7 +6,7 @@ A Stable Diffusion WebUI script that enables random aspect ratio generation whil
 
 - Supports common aspect ratios (21:9, 16:9, 3:2, 4:3, 1:1, etc.)
 - Supports custom aspect ratios via Settings menu
-- SAutomatically adjusts dimensions (default 64px multiples) to maintain extension compatibility
+- Automatically adjusts dimensions (default 64px multiples) to maintain extension compatibility
 - Maintains consistent image quality by preserving total pixel area
 
 ## Usage
