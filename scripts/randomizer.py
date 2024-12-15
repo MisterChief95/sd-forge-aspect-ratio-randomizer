@@ -102,7 +102,6 @@ def get_expanded_aspect_ratios() -> dict[str, AspectRatio]:
 ASPECT_RATIOS: dict[str, AspectRatio] = get_expanded_aspect_ratios()
 
 
-# TODO: Add settings options to allow users to add custom aspect ratios
 class AspectRatioRandomizer(scripts.Script):
     def __init__(self):
         self.seed_to_ratio: dict[int, AspectRatio] = {}
