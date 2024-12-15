@@ -103,9 +103,6 @@ ASPECT_RATIOS: dict[str, AspectRatio] = get_expanded_aspect_ratios()
 
 
 class AspectRatioRandomizer(scripts.Script):
-    def __init__(self):
-        self.seed_to_ratio: dict[int, AspectRatio] = {}
-
     def title(self):
         return "Aspect Ratio Randomizer"
 
