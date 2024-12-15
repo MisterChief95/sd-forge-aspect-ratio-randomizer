@@ -5,8 +5,9 @@ A Stable Diffusion WebUI script that enables random aspect ratio generation whil
 ## Features
 
 - Supports common aspect ratios (21:9, 16:9, 3:2, 4:3, 1:1, etc.)
+- Supports custom aspect ratios via Settings menu
+- SAutomatically adjusts dimensions (default 64px multiples) to maintain extension compatibility
 - Maintains consistent image quality by preserving total pixel area
-- Automatically adjusts dimensions to be multiples of 64 pixels
 
 ## Usage
 
@@ -23,7 +24,7 @@ The randomizer works through the following process:
 
 1. Takes a base width and calculates dimensions that:
    - Match the chosen aspect ratio
-   - Are divisible by 64 pixels
+   - Are divisible by 64 (default) pixels
        - Maintains compatibility with other extensions such as HiDiffusion
 
 2. Area preservation is achieved by:
