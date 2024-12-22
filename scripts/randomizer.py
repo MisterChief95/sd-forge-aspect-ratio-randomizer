@@ -42,20 +42,20 @@ class Size:
         yield self.height
 
 
-def calc_nearest_res_for_ratio(width: int, aspectRatio: AspectRatio) -> Size:
-    if aspectRatio.ratio == 1:
+def calc_nearest_res_for_ratio(width: int, aspect_ratio: AspectRatio) -> Size:
+    if aspect_ratio.ratio == 1:
         return Size(width, width)
 
     base_area = width * width
 
-    if aspectRatio.ratio > 1:
+    if aspect_ratio.ratio > 1:
         # Scale width for positive ratios
-        new_width = int(math.sqrt(base_area * aspectRatio.ratio))
-        new_height = int(new_width / aspectRatio.ratio)
+        new_width = int(math.sqrt(base_area * aspect_ratio.ratio))
+        new_height = int(new_width / aspect_ratio.ratio)
     else:
         # Scale height for negative ratios
-        new_height = int(math.sqrt(base_area / aspectRatio.ratio))
-        new_width = int(new_height * aspectRatio.ratio)
+        new_height = int(math.sqrt(base_area / aspect_ratio.ratio))
+        new_width = int(new_height * aspect_ratio.ratio)
 
     pixel_rounding: float = max(1, shared.opts.data.get("arr_round_to", 64))
 
