@@ -100,6 +100,10 @@ def get_expanded_aspect_ratios() -> dict[str, AspectRatio]:
 
 
 ASPECT_RATIOS: dict[str, AspectRatio] = get_expanded_aspect_ratios()
+ratio_keys = list(ASPECT_RATIOS.keys())
+IDX_1_1 = ratio_keys.index("1:1")
+WIDE_RATIO_KEYS = ratio_keys[:IDX_1_1]
+TALL_RATIO_KEYS = ratio_keys[IDX_1_1 + 1 :]
 
 
 class AspectRatioRandomizer(scripts.Script):
@@ -125,6 +129,11 @@ class AspectRatioRandomizer(scripts.Script):
         with gr.Row():
             select_all = gr.Button(value="Select All")
             select_none = gr.Button(value="Select None")
+        with gr.Row():
+            select_wide = gr.Button(value="Select Wide")
+            select_tall = gr.Button(value="Select Tall")
+        with gr.Row():
+            invert_select = gr.Button(value="Invert Selection")
 
         select_all.click(
             lambda _: gr.CheckboxGroup(value=list(ASPECT_RATIOS.keys())),
@@ -133,6 +142,23 @@ class AspectRatioRandomizer(scripts.Script):
         )
         select_none.click(
             lambda _: gr.CheckboxGroup(value=[]), inputs=[ratios], outputs=[ratios]
+        )
+        select_wide.click(
+            lambda _: gr.CheckboxGroup(value=WIDE_RATIO_KEYS),
+            inputs=[ratios],
+            outputs=[ratios],
+        )
+        select_tall.click(
+            lambda _: gr.CheckboxGroup(value=TALL_RATIO_KEYS),
+            inputs=[ratios],
+            outputs=[ratios],
+        )
+        invert_select.click(
+            lambda ratios: gr.CheckboxGroup(
+                value=list(set(ASPECT_RATIOS) - set(ratios))
+            ),
+            inputs=[ratios],
+            outputs=[ratios],
         )
 
         return [ratios]
