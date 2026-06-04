@@ -1,31 +1,25 @@
 import math
 import random
-import copy
 from dataclasses import dataclass
 from functools import cached_property
 
 import gradio as gr
 
-from backend import memory_management
-
 from modules import errors, scripts
-from modules.processing import (
-    Processed,
-    StableDiffusionProcessingTxt2Img,
-    fix_seed,
-    process_images,
-)
+from modules import processing as processing_module
+from modules import rng as rng_module
+from modules.processing import StableDiffusionProcessingTxt2Img
 from modules.script_callbacks import on_ui_settings
-from modules.sd_models import model_data, select_checkpoint
 from modules.shared import (
-    OptionInfo, 
-    opts, 
-    state,
-    total_tqdm,
+    OptionInfo,
+    opts,
 )
+from modules.ui_components import InputAccordion
 
 
 DEFAULT_ASPECT_RATIOS: list[str] = ["21:9", "16:9", "3:2", "4:3", "1:1"]
+
+LOG = "[Aspect Ratio Randomizer]"
 
 
 @dataclass
@@ -63,7 +57,8 @@ def calc_nearest_res_for_ratio(width: int, aspect_ratio: AspectRatio) -> Size:
         new_height = int(math.sqrt(base_area / aspect_ratio.ratio))
         new_width = int(new_height * aspect_ratio.ratio)
 
-    pixel_rounding: float = max(1, opts.data.get("arr_round_to", 64))
+    # Follow the WebUI's built-in "Resolution Step" so computed sizes stay valid.
+    pixel_rounding: float = max(1, opts.data.get("res_step", 64))
 
     new_width = int(round(float(new_width) / pixel_rounding) * pixel_rounding)
     new_height = int(round(float(new_height) / pixel_rounding) * pixel_rounding)
@@ -85,15 +80,25 @@ def reverse_ratio(ratio: str) -> str:
 
 
 def get_expanded_aspect_ratios() -> dict[str, AspectRatio]:
-    custom_ratios = (
-        (opts.data.get("arr_custom_ratios", "") or "").strip().split(",")
-    )
-    custom_ratios = [
-        ar.strip()
-        for ar in custom_ratios
-        if ":" in ar and ar.replace(":", "").isdigit()
-    ]
-    all_ratios = DEFAULT_ASPECT_RATIOS + custom_ratios
+    raw = (opts.data.get("arr_custom_ratios", "") or "").split(",")
+    # strip, drop empties, dedupe while preserving order
+    custom_ratios = list(dict.fromkeys(ar.strip() for ar in raw if ar.strip()))
+    valid_custom_ratios: list[str] = []
+
+    for ar in custom_ratios:
+        parts = ar.split(":")
+        if (
+            len(parts) == 2
+            and parts[0].isdigit()
+            and parts[1].isdigit()
+            and int(parts[0]) > 0
+            and int(parts[1]) > 0
+        ):
+            valid_custom_ratios.append(ar)
+        else:
+            print(f"{LOG} ignoring invalid custom aspect ratio: '{ar}'")
+
+    all_ratios = DEFAULT_ASPECT_RATIOS + valid_custom_ratios
     expanded_ratios = all_ratios + [reverse_ratio(ratio) for ratio in all_ratios]
 
     return dict(
@@ -113,233 +118,266 @@ TALL_RATIO_KEYS = ratio_keys[IDX_1_1 + 1 :]
 
 
 class AspectRatioRandomizer(scripts.Script):
+    section = "dimensions"
+    create_group = False
+    sorting_priority = 15
+
     def title(self):
         return "Aspect Ratio Randomizer"
 
+    def show(self, is_img2img):
+        # Always-on accordion (like ControlNet/FreeU), coexists with other scripts.
+        return scripts.AlwaysVisible
+
     def ui(self, is_img2img):
-        if is_img2img:
+        with InputAccordion(
+            False, label=self.title(), elem_id="arr-enabled"
+        ) as enabled:
+            if is_img2img:
+                gr.Markdown(
+                    "Aspect Ratio Randomizer only affects **txt2img** — changing the "
+                    "resolution mid-run would distort an img2img init image, so it does "
+                    "nothing here."
+                )
+                # Hidden placeholders so the returned arg count stays stable.
+                ratios = gr.CheckboxGroup(
+                    choices=list(ASPECT_RATIOS.keys()), visible=False
+                )
+                clamp_to_resolutions = gr.Checkbox(value=False, visible=False)
+                match_seeds = gr.Checkbox(value=True, visible=False)
+                variants_per_resolution = gr.Slider(
+                    minimum=1, maximum=100, step=1, value=1, visible=False
+                )
+                return [enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution]
+
+            with gr.Row():
+                ratios = gr.CheckboxGroup(
+                    label="Aspect Ratios",
+                    choices=list(ASPECT_RATIOS.keys()),
+                    info="Select the aspect ratios you want to randomize between. Order is: Wide - Square - Tall",
+                )
+
             gr.Markdown(
-                "This script is only available for text-to-image tasks. Please switch to Txt2Img tab to use this script."
+                "**Batch count** = number of aspect ratios; **batch size** = max images "
+                "generated concurrently (VRAM). The slider below sets how many variants to "
+                "render per resolution (it can exceed the batch size limit of 8). "
+                "Total images = batch count x variants per resolution."
+            )
+
+            variants_per_resolution = gr.Slider(
+                minimum=1,
+                maximum=100,
+                step=1,
+                value=1,
+                label="Variants per resolution",
+                info="How many images to render at each resolution. Generated in GPU batches of 'batch size'. Can go higher than the batch size limit.",
+            )
+
+            match_seeds = gr.Checkbox(
+                value=True,
+                label="Use the same seed across all resolutions",
+                info="Renders the same seed(s) at every aspect ratio so you can compare them directly. Uncheck to let seeds advance normally per batch.",
+            )
+
+            clamp_to_resolutions = gr.Checkbox(
+                value=False,
+                label="Limit batch count to number of selected resolutions",
+                info="When enabled, the batch count is reduced so each selected ratio is used at most once (a message is logged).",
+            )
+
+            with gr.Row():
+                select_all = gr.Button(value="Select All")
+                select_none = gr.Button(value="Select None")
+            with gr.Row():
+                select_wide = gr.Button(value="Select Wide")
+                select_tall = gr.Button(value="Select Tall")
+            with gr.Row():
+                invert_select = gr.Button(value="Invert Selection")
+
+            select_all.click(
+                lambda _: gr.CheckboxGroup(value=list(ASPECT_RATIOS.keys())),
+                inputs=[ratios],
+                outputs=[ratios],
+            )
+            select_none.click(
+                lambda _: gr.CheckboxGroup(value=[]), inputs=[ratios], outputs=[ratios]
+            )
+            select_wide.click(
+                lambda _: gr.CheckboxGroup(value=WIDE_RATIO_KEYS),
+                inputs=[ratios],
+                outputs=[ratios],
+            )
+            select_tall.click(
+                lambda _: gr.CheckboxGroup(value=TALL_RATIO_KEYS),
+                inputs=[ratios],
+                outputs=[ratios],
+            )
+            invert_select.click(
+                lambda ratios: gr.CheckboxGroup(
+                    value=list(set(ASPECT_RATIOS) - set(ratios))
+                ),
+                inputs=[ratios],
+                outputs=[ratios],
+            )
+
+        return [enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution]
+
+    def before_process(self, p, enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution):
+        """Reconfigure the batch loop into resolution / variant / concurrency groups.
+
+        Interpretation of the controls:
+          - batch count (p.n_iter)    -> number of resolutions (R)
+          - batch size (p.batch_size) -> max images generated concurrently (the GPU batch, L)
+          - variants_per_resolution   -> how many variants to render per resolution (V)
+
+        We rewrite the real ``p.n_iter`` / ``p.batch_size`` accordingly. This runs
+        before ``setup_prompts``/``all_seeds`` are built (processing.py), so the
+        rewrite correctly resizes the prompt/seed arrays and the job/step counters.
+        Each GPU batch (``ceil(V / L)`` per resolution) stays at a single resolution.
+        """
+        p._arr_active = False
+
+        if not enabled:
+            return
+        if not isinstance(p, StableDiffusionProcessingTxt2Img):
+            return  # img2img init image would be distorted
+        if getattr(p, "txt2img_upscale", False):
+            return  # hires "quick upscale" button: leave dimensions alone
+
+        if not ratios:
+            errors.display(
+                ValueError(
+                    "[Aspect Ratio Randomizer] Please select at least one aspect ratio"
+                )
             )
             return
 
-        with gr.Row():
-            ratios = gr.CheckboxGroup(
-                label="Aspect Ratios",
-                choices=list(ASPECT_RATIOS.keys()),
-                info="Select the aspect ratios you want to randomize between. Order is: Wide - Square - Tall",
+        selected = [ASPECT_RATIOS[r] for r in ratios if r in ASPECT_RATIOS]
+        if not selected:
+            return
+
+        resolutions = p.n_iter           # batch count -> number of resolutions (R)
+        variants = max(1, int(variants_per_resolution or 1))       # slider -> variants (V)
+        concurrency = max(1, min(p.batch_size, variants))          # batch size -> GPU batch (L)
+
+        # Optionally cap the number of resolutions so each selected ratio is used once.
+        if clamp_to_resolutions and resolutions > len(selected):
+            print(
+                f"{LOG} limiting resolutions {resolutions} -> {len(selected)} "
+                f"(one per selected ratio)"
+            )
+            resolutions = len(selected)
+
+        # GPU batches needed to cover V variants at L-at-a-time (rounds up).
+        chunks_per_res = math.ceil(variants / concurrency)
+
+        # One ratio per resolution. Reshuffle each full pass so ratios don't repeat
+        # until the whole selection has been used.
+        plan: list[AspectRatio] = []
+        pool: list[AspectRatio] = []
+        for _ in range(resolutions):
+            if not pool:
+                pool = selected[:]
+                random.shuffle(pool)
+            plan.append(pool.pop())
+
+        # Rewrite the real Forge batch params.
+        p.batch_size = concurrency
+        p.n_iter = resolutions * chunks_per_res
+
+        p._arr_active = True
+        p._arr_base_w = p.width
+        p._arr_plan = plan
+        p._arr_chunks_per_res = chunks_per_res
+        # When matching seeds, each resolution's variant seeds (keyed by chunk index)
+        # are captured during the first resolution and reused for the rest.
+        p._arr_seed_bank: dict[int, list] = {}
+        p._arr_subseed_bank: dict[int, list] = {}
+
+        total = p.n_iter * p.batch_size
+        ratio_list = ", ".join(f"{r.antecedent}:{r.consequent}" for r in plan)
+        print(
+            f"{LOG} {resolutions} resolution(s) x {chunks_per_res * concurrency} "
+            f"variant(s) = {total} image(s) | GPU batch {concurrency}, {p.n_iter} batches"
+            f"\n{LOG} ratios: {ratio_list}"
+        )
+
+        # Mixed resolutions make the output grid look broken.
+        if len({(r.antecedent, r.consequent) for r in plan}) > 1:
+            p.do_not_save_grid = True
+
+    def before_process_batch(self, p, enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution, **kwargs):
+        """Apply this batch's resolution and rebuild the noise to match.
+
+        The pipeline builds ``_shape``/``p.rng`` from ``p.width``/``p.height`` just
+        *before* this hook fires (processing.py), so simply changing the dimensions
+        is not enough — we must rebuild ``p.rng`` ourselves here.
+        """
+        if not getattr(p, "_arr_active", False):
+            return
+
+        batch_number = kwargs.get("batch_number", 0)
+        chunks_per_res = p._arr_chunks_per_res
+        res_index = batch_number // chunks_per_res
+        chunk_index = batch_number % chunks_per_res
+
+        # Reuse each resolution's variant seeds (by chunk) so the same seeds render at
+        # every aspect ratio. Must happen before the RNG rebuild (it reads p.seeds).
+        if match_seeds:
+            if res_index == 0:
+                p._arr_seed_bank[chunk_index] = list(p.seeds)
+                p._arr_subseed_bank[chunk_index] = list(p.subseeds)
+            else:
+                p.seeds = list(p._arr_seed_bank[chunk_index])
+                p.subseeds = list(p._arr_subseed_bank[chunk_index])
+                bs = p.batch_size
+                lo = batch_number * bs
+                hi = lo + bs
+                p.all_seeds[lo:hi] = p.seeds
+                p.all_subseeds[lo:hi] = p.subseeds
+
+        ratio = p._arr_plan[res_index]
+        p.width, p.height = calc_nearest_res_for_ratio(p._arr_base_w, ratio)
+
+        # Record the chosen ratio in this batch's image metadata (PNG info / infotext).
+        p.extra_generation_params["Aspect ratio"] = f"{ratio.antecedent}:{ratio.consequent}"
+
+        if opts.data.get("arr_log_each_batch", True):
+            resolutions = len(p._arr_plan)
+            print(
+                f"{LOG} batch {batch_number + 1}/{p.n_iter} | "
+                f"resolution {res_index + 1}/{resolutions} ({ratio.antecedent}:{ratio.consequent}) "
+                f"-> {p.width}x{p.height} | seeds {p.seeds}"
             )
 
-        gr.HTML("<br>")
+        self._rebuild_rng(p)
 
-        total_ratios_to_generate = gr.Slider(
-            minimum=1,
-            maximum=1,
-            step=1,
-            value=1,
-            label="Number of Ratios to Generate",
-            info="Generate images using this many randomly selected aspect ratios"
+        # init() computed hires targets once from the original size; recompute them
+        # for this batch's base resolution.
+        if getattr(p, "enable_hr", False) and hasattr(p, "calculate_target_resolution"):
+            p.calculate_target_resolution()
+
+    @staticmethod
+    def _rebuild_rng(p):
+        """Rebuild the noise RNG so the latent matches the new resolution.
+
+        The pipeline already built ``p.rng`` for this batch (processing.py), so we
+        reuse its shape and only swap the trailing spatial dims. This automatically
+        preserves the latent channel count and any extra dimension used by Wan-based
+        models (e.g. Anima), instead of reconstructing the shape from scratch.
+        """
+        opt_f = processing_module.opt_f  # runtime VAE downscale factor (usually 8)
+        old_shape = tuple(p.rng.shape)
+        new_shape = old_shape[:-2] + (p.height // opt_f, p.width // opt_f)
+        p.rng = rng_module.ImageRNG(
+            new_shape,
+            p.seeds,
+            subseeds=p.subseeds,
+            subseed_strength=p.subseed_strength,
+            seed_resize_from_h=p.seed_resize_from_h,
+            seed_resize_from_w=p.seed_resize_from_w,
         )
 
-        def update_slider_max(selected_ratios, total_ratios):
-            max_val = max(1, len(selected_ratios))
-            current_val = min(total_ratios.value if hasattr(total_ratios, 'value') else 1, max_val)
-            return gr.Slider(maximum=max_val, value=current_val)
-        
-        ratios.change(
-            update_slider_max,
-            inputs=[ratios, total_ratios_to_generate],
-            outputs=[total_ratios_to_generate]
-        )
-
-        gr.HTML("<br>")
-
-        with gr.Row():
-            select_all = gr.Button(value="Select All")
-            select_none = gr.Button(value="Select None")
-        with gr.Row():
-            select_wide = gr.Button(value="Select Wide")
-            select_tall = gr.Button(value="Select Tall")
-        with gr.Row():
-            invert_select = gr.Button(value="Invert Selection")
-
-        select_all.click(
-            lambda _: gr.CheckboxGroup(value=list(ASPECT_RATIOS.keys())),
-            inputs=[ratios],
-            outputs=[ratios],
-        )
-        select_none.click(
-            lambda _: gr.CheckboxGroup(value=[]), inputs=[ratios], outputs=[ratios]
-        )
-        select_wide.click(
-            lambda _: gr.CheckboxGroup(value=WIDE_RATIO_KEYS),
-            inputs=[ratios],
-            outputs=[ratios],
-        )
-        select_tall.click(
-            lambda _: gr.CheckboxGroup(value=TALL_RATIO_KEYS),
-            inputs=[ratios],
-            outputs=[ratios],
-        )
-        invert_select.click(
-            lambda ratios: gr.CheckboxGroup(
-                value=list(set(ASPECT_RATIOS) - set(ratios))
-            ),
-            inputs=[ratios],
-            outputs=[ratios],
-        )
-
-        return [ratios, total_ratios_to_generate]
-
-    def run(self, p: StableDiffusionProcessingTxt2Img, ratios, total_ratios_to_generate):
-        # Skip randomization if quick upscaling
-        if hasattr(p, "txt2img_upscale") and p.txt2img_upscale:
-            return process_images(p)
-
-        if not ratios:
-            errors.display(ValueError(
-                "[Aspect Ratio Randomizer] Please select at least one aspect ratio"
-            ))
-
-        fix_seed(p)
-
-        original_width = p.width
-        iterations = p.n_iter * p.batch_size
-
-        p.n_iter = 1
-        p.batch_size = 1
-
-        # Wildly different resolutions can make the grid image look weird
-        p.do_not_save_grid = True
-
-        selected_ratios = [ASPECT_RATIOS[ratio] for ratio in ratios]
-        
-        # Calculate total images needed
-        total_images = iterations * total_ratios_to_generate
-        
-        # Create all processing objects
-        processing_objects: list[StableDiffusionProcessingTxt2Img] = [p]
-        
-        # Create copies for all additional images
-        for i in range(1, total_images):
-            p_copy = copy.copy(p)
-            # Seed is based on which iteration batch this belongs to
-            iteration_num = i // total_ratios_to_generate
-            p_copy.seed = p.seed + iteration_num
-            processing_objects.append(p_copy)
-        
-        # Pre-generate random ratio selections for each iteration to avoid duplicates
-        ratio_selections = []
-        for iteration in range(iterations):
-            if total_ratios_to_generate == len(selected_ratios):
-                # Use all ratios in consistent order
-                iteration_ratios = selected_ratios[:]
-            elif total_ratios_to_generate <= len(selected_ratios):
-                # Sample without replacement to avoid duplicates
-                iteration_ratios = random.sample(selected_ratios, total_ratios_to_generate)
-            else:
-                # Need more ratios than available, sample with replacement
-                iteration_ratios = random.choices(selected_ratios, k=total_ratios_to_generate)
-            ratio_selections.extend(iteration_ratios)
-        
-        # Assign ratios to each processing object
-        for idx, pc in enumerate(processing_objects):
-            ratio = ratio_selections[idx]
-                
-            pc.width, pc.height = calc_nearest_res_for_ratio(original_width, ratio)
-
-        hr_steps = p.hr_second_pass_steps if p.enable_hr else 0
-        # Calculate total images that will be generated across all processing objects
-        total_images = sum(pc.n_iter * pc.batch_size for pc in processing_objects)
-        total_steps = sum(pc.n_iter * (pc.steps + hr_steps) * pc.batch_size for pc in processing_objects)
-
-        state.job_count = total_images
-        total_tqdm.updateTotal(total_steps)
-
-        processed_result: Processed = None
-
-        for idx, p in enumerate(processing_objects):
-            memory_management.soft_empty_cache()
-
-            if state.interrupted or state.stopping_generation:
-                return Processed(p, [], p.seed, "")
-            elif state.skipped:
-                continue
-
-            processed: Processed = None
-
-            try:
-                processed = process_images(p)
-            except Exception as e:
-                errors.display(e, "generating image with random aspect ratio")
-
-            if processed is None:
-                continue
-
-            if processed_result is None:
-                # Initialize with the first processed result
-                processed_result = copy.copy(processed)
-                processed_result.images = []
-                processed_result.all_prompts = []
-                processed_result.all_seeds = []
-                processed_result.infotexts = []
-                processed_result.index_of_first_image = 0
-
-                # Update TQDM - other scripts may have changed final counts
-                total_images *= len(processed.images)
-                total_steps *= len(processed.images)
-
-                state.job_count = total_images
-                total_tqdm.updateTotal(total_steps)
-
-            # Append ALL images and related data from this generation
-            if processed.images:
-                processed_result.images.extend(processed.images)
-                processed_result.all_prompts.extend(processed.all_prompts)
-                processed_result.all_seeds.extend(processed.all_seeds)
-                processed_result.infotexts.extend(processed.infotexts)
-
-            memory_management.soft_empty_cache()
-
-        # Reorder the collections to group by ratio position rather than iteration
-        if processed_result and total_ratios_to_generate > 1:
-            # Calculate number of iterations
-            num_iterations = len(processed_result.images) // total_ratios_to_generate
-            
-            # Create temporary lists to hold reordered data
-            reordered_images = []
-            reordered_prompts = []
-            reordered_seeds = []
-            reordered_infotexts = []
-            
-            # Reorder: instead of [1,1,1,1,2,2,2,2,3,3,3,3] we want [1,2,3,1,2,3,1,2,3,1,2,3]
-            for ratio_idx in range(total_ratios_to_generate):
-                for iter_idx in range(num_iterations):
-                    source_idx = iter_idx * total_ratios_to_generate + ratio_idx
-                    if source_idx < len(processed_result.images):
-                        reordered_images.append(processed_result.images[source_idx])
-                        reordered_prompts.append(processed_result.all_prompts[source_idx])
-                        reordered_seeds.append(processed_result.all_seeds[source_idx])
-                        reordered_infotexts.append(processed_result.infotexts[source_idx])
-            
-            # Replace the original collections with reordered ones
-            processed_result.images = reordered_images
-            processed_result.all_prompts = reordered_prompts
-            processed_result.all_seeds = reordered_seeds
-            processed_result.infotexts = reordered_infotexts
-
-        checkpoint_info = select_checkpoint()
-
-        model_data.forge_loading_parameters = dict(
-            checkpoint_info=checkpoint_info,
-            additional_modules=opts.forge_additional_modules,
-            # unet_storage_dtype=opts.forge_unet_storage_dtype
-            unet_storage_dtype=model_data.forge_loading_parameters.get(
-                "unet_storage_dtype", None
-            ),
-        )
-
-        return processed_result
 
 section = ("arr", "Aspect Ratio Randomizer")
 
@@ -360,15 +398,13 @@ def on_settings():
     )
 
     opts.add_option(
-        "arr_round_to",
+        "arr_log_each_batch",
         OptionInfo(
-            64,
-            "Pixel Rounding",
-            gr.Slider,
-            {"minimum": 0, "maximum": 128, "step": 32},
+            True,
+            "Log each batch's resolution to the console",
             section=section,
         ).info(
-            "Round the calculated width and height to the nearest multiple of this number."
+            "Prints a line per batch showing the chosen ratio, resolution and seeds. Disable to keep the console quiet on large runs (the run summary is always printed)."
         ),
     )
 
@@ -376,4 +412,4 @@ def on_settings():
 on_ui_settings(on_settings)
 
 
-print("Aspect Ratio Randomizer Loaded")
+print(f"{LOG} loaded")
