@@ -18,6 +18,12 @@ from modules.ui_components import InputAccordion
 
 
 DEFAULT_ASPECT_RATIOS: list[str] = ["21:9", "16:9", "3:2", "4:3", "1:1"]
+RATIO_SELECTION_MODES: list[str] = [
+    "Random, no repeats",
+    "Selected order",
+    "Sequential rotating",
+    "Random with replacement",
+]
 
 LOG = "[Aspect Ratio Randomizer]"
 
@@ -133,34 +139,42 @@ class AspectRatioRandomizer(scripts.Script):
             False, label=self.title(), elem_id="arr-enabled"
         ) as enabled:
             gr.Markdown(
-                "**Batch count** = number of aspect ratios. "
-                "**Batch size** = max images generated concurrently"
+                "**Batch count** controls comparison groups. "
+                "**Batch size** is the maximum GPU parallelism."
             )
             gr.Markdown(
                 "The **Width** setting is used as a base size to compute the others from, "
                 "so pick one that works for all your ratios (e.g. 1024 for SDXL)."
             )
 
-            variants_per_resolution = gr.Slider(
+            variants_per_ratio = gr.Slider(
                 minimum=1,
                 maximum=100,
                 step=1,
                 value=1,
-                label="Variants per resolution",
-                info="Number of images to generate for each selected aspect ratio",
+                label="Variants per ratio",
+                info="Number of seed / prompt variants to render for each ratio in each comparison group",
+            )
+
+            ratios_per_batch = gr.Slider(
+                minimum=1,
+                maximum=100,
+                step=1,
+                value=1,
+                label="Ratios per batch",
+                info="Number of selected aspect ratios to render for each comparison group",
             )
 
             with gr.Row():
-                match_seeds = gr.Checkbox(
-                    value=True,
-                    label="Use the same seed across all resolutions",
-                    info="Also reuses each variant's exact prompt, so wildcard / "
-                         "Dynamic Prompts picks stay identical across resolutions too",
+                selection_mode = gr.Dropdown(
+                    choices=RATIO_SELECTION_MODES,
+                    value=RATIO_SELECTION_MODES[0],
+                    label="Ratio selection",
                 )
 
-                clamp_to_resolutions = gr.Checkbox(
-                    value=False,
-                    label="Limit batch count to number of selected resolutions",
+                sort_gallery = gr.Checkbox(
+                    value=True,
+                    label="Sort gallery by seed then resolution",
                 )
 
             with gr.Row():
@@ -205,20 +219,16 @@ class AspectRatioRandomizer(scripts.Script):
                 outputs=[ratios],
             )
 
-        return [enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution]
+        return [enabled, ratios, variants_per_ratio, ratios_per_batch, selection_mode, sort_gallery]
 
-    def before_process(self, p, enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution):
-        """Reconfigure the batch loop into resolution / variant / concurrency groups.
+    def before_process(self, p, enabled, ratios, variants_per_ratio, ratios_per_batch, selection_mode, sort_gallery):
+        """Configure Forge's prompt/seed arrays for exact comparison groups.
 
-        Interpretation of the controls:
-          - batch count (p.n_iter)    -> number of resolutions (R)
-          - batch size (p.batch_size) -> max images generated concurrently (the GPU batch, L)
-          - variants_per_resolution   -> how many variants to render per resolution (V)
-
-        We rewrite the real ``p.n_iter`` / ``p.batch_size`` accordingly. This runs
-        before ``setup_prompts``/``all_seeds`` are built (processing.py), so the
-        rewrite correctly resizes the prompt/seed arrays and the job/step counters.
-        Each GPU batch (``ceil(V / L)`` per resolution) stays at a single resolution.
+        ``batch count`` is treated as the number of comparison groups, while
+        ``variants_per_ratio`` controls how many seed/prompt variants are created
+        per group. ``batch size`` stays a maximum: we choose the largest exact
+        chunk size that divides ``variants_per_ratio`` and does not exceed the
+        user's requested batch size.
         """
         p._arr_active = False
 
@@ -241,65 +251,137 @@ class AspectRatioRandomizer(scripts.Script):
         if not selected:
             return
 
-        resolutions = p.n_iter           # batch count -> number of resolutions (R)
-        variants = max(1, int(variants_per_resolution or 1))       # slider -> variants (V)
-        concurrency = max(1, min(p.batch_size, variants))          # batch size -> GPU batch (L)
-
-        # Optionally cap the number of resolutions so each selected ratio is used once.
-        if clamp_to_resolutions and resolutions > len(selected):
-            print(
-                f"{LOG} limiting resolutions {resolutions} -> {len(selected)} "
-                f"(one per selected ratio)"
-            )
-            resolutions = len(selected)
-
-        # GPU batches needed to cover V variants at L-at-a-time (rounds up).
-        chunks_per_res = math.ceil(variants / concurrency)
-
-        # One ratio per resolution. Reshuffle each full pass so ratios don't repeat
-        # until the whole selection has been used.
-        plan: list[AspectRatio] = []
-        pool: list[AspectRatio] = []
-        for _ in range(resolutions):
-            if not pool:
-                pool = selected[:]
-                random.shuffle(pool)
-            plan.append(pool.pop())
-
-        # Rewrite the real Forge batch params.
-        p.batch_size = concurrency
-        p.n_iter = resolutions * chunks_per_res
-
         p._arr_active = True
         p._arr_base_w = p.width
-        p._arr_plan = plan
-        p._arr_chunks_per_res = chunks_per_res
+        p._arr_selected = selected
+        p._arr_group_count = max(1, int(p.n_iter))
+        p._arr_variants_per_ratio = max(1, int(variants_per_ratio or 1))
+        p._arr_requested_batch_size = max(1, int(p.batch_size))
+        p._arr_chunk_size = self._largest_divisor_at_most(
+            p._arr_variants_per_ratio,
+            p._arr_requested_batch_size,
+        )
+        p._arr_chunks_per_group = p._arr_variants_per_ratio // p._arr_chunk_size
+        p._arr_ratios_per_batch = max(1, int(ratios_per_batch or 1))
+        p._arr_selection_mode = selection_mode if selection_mode in RATIO_SELECTION_MODES else RATIO_SELECTION_MODES[0]
+        p._arr_sort_gallery = bool(sort_gallery)
+        p._arr_plan = []
         p._arr_overflow_warned = False
-        # When matching seeds, each comparison group's variant seeds *and* prompts
-        # (keyed by group and chunk index) are captured during the first resolution
-        # in that group and reused for the rest. This also pins wildcard / Dynamic
-        # Prompts picks across resolutions without forcing later groups to cycle
-        # back to the first group's seeds.
-        p._arr_group_size = max(1, min(len(selected), resolutions))
-        p._arr_seed_bank = {}
-        p._arr_subseed_bank = {}
-        p._arr_prompt_bank = {}
-        p._arr_neg_prompt_bank = {}
         p._arr_gallery_sort_keys = []
 
-        total = p.n_iter * p.batch_size
-        ratio_list = ", ".join(f"{r.antecedent}:{r.consequent}" for r in plan)
-        print(
-            f"{LOG} {resolutions} resolution(s) x {chunks_per_res * concurrency} "
-            f"variant(s) = {total} image(s) | GPU batch {concurrency}, {p.n_iter} batches"
-            f"\n{LOG} ratios: {ratio_list}"
+        p.batch_size = p._arr_chunk_size
+        p.n_iter = p._arr_group_count * p._arr_chunks_per_group
+
+        if p._arr_chunk_size != p._arr_requested_batch_size:
+            print(
+                f"{LOG} using GPU batch {p._arr_chunk_size} instead of requested "
+                f"{p._arr_requested_batch_size} so {p._arr_variants_per_ratio} "
+                f"variant(s) per ratio stay exact"
+            )
+
+    def process(self, p, enabled, ratios, variants_per_ratio, ratios_per_batch, selection_mode, sort_gallery):
+        """Repeat each comparison group's source variants across selected ratios.
+
+        This hook runs after ``setup_prompts()`` and after Dynamic Prompts when the
+        extension metadata loads ARR after sd-dynamic-prompts. We duplicate each
+        already-expanded prompt/seed group across ratios, keeping the exact
+        internal chunk size chosen in ``before_process``.
+        """
+        if not getattr(p, "_arr_active", False):
+            return
+
+        selected = getattr(p, "_arr_selected", [])
+        if not selected:
+            return
+
+        batch_size = max(1, int(p.batch_size))
+        group_count = max(1, int(getattr(p, "_arr_group_count", p.n_iter)))
+        variants = max(1, int(getattr(p, "_arr_variants_per_ratio", 1)))
+        expected_source_count = group_count * variants
+        aligned_lengths = [
+            len(getattr(p, "all_prompts", []) or []),
+            len(getattr(p, "all_negative_prompts", []) or []),
+            len(getattr(p, "all_seeds", []) or []),
+            len(getattr(p, "all_subseeds", []) or []),
+        ]
+        source_count = min(min(aligned_lengths), expected_source_count)
+        if source_count == 0:
+            return
+        if len(set(aligned_lengths + [expected_source_count])) > 1:
+            print(
+                f"{LOG} warning: prompt/seed array lengths differ or were changed "
+                f"{aligned_lengths}, expected {expected_source_count}; using the "
+                f"first {source_count} aligned item(s)"
+            )
+
+        ratio_count = self._effective_ratio_count(
+            selected,
+            getattr(p, "_arr_ratios_per_batch", 1),
+            getattr(p, "_arr_selection_mode", RATIO_SELECTION_MODES[0]),
         )
 
-        # Mixed resolutions make the output grid look broken.
-        if len({(r.antecedent, r.consequent) for r in plan}) > 1:
+        batch_ratio_plan: list[AspectRatio] = []
+        expanded_prompts: list = []
+        expanded_negative_prompts: list = []
+        expanded_seeds: list = []
+        expanded_subseeds: list = []
+        expanded_hr_prompts: list | None = [] if self._has_aligned_list(p, "all_hr_prompts", source_count) else None
+        expanded_hr_negative_prompts: list | None = [] if self._has_aligned_list(p, "all_hr_negative_prompts", source_count) else None
+
+        usable_groups = math.ceil(source_count / variants)
+        for group_index in range(usable_groups):
+            batch_ratios = self._select_ratios_for_batch(
+                selected,
+                ratio_count,
+                getattr(p, "_arr_selection_mode", RATIO_SELECTION_MODES[0]),
+                group_index,
+            )
+
+            for ratio in batch_ratios:
+                group_lo = group_index * variants
+                group_hi = min(group_lo + variants, source_count)
+
+                for chunk_lo in range(group_lo, group_hi, batch_size):
+                    chunk_hi = min(chunk_lo + batch_size, group_hi)
+
+                    batch_ratio_plan.append(ratio)
+                    expanded_prompts.extend(p.all_prompts[chunk_lo:chunk_hi])
+                    expanded_negative_prompts.extend(p.all_negative_prompts[chunk_lo:chunk_hi])
+                    expanded_seeds.extend(p.all_seeds[chunk_lo:chunk_hi])
+                    expanded_subseeds.extend(p.all_subseeds[chunk_lo:chunk_hi])
+
+                    if expanded_hr_prompts is not None:
+                        expanded_hr_prompts.extend(p.all_hr_prompts[chunk_lo:chunk_hi])
+                    if expanded_hr_negative_prompts is not None:
+                        expanded_hr_negative_prompts.extend(p.all_hr_negative_prompts[chunk_lo:chunk_hi])
+
+        p.all_prompts = expanded_prompts
+        p.all_negative_prompts = expanded_negative_prompts
+        p.all_seeds = expanded_seeds
+        p.all_subseeds = expanded_subseeds
+
+        if expanded_hr_prompts is not None:
+            p.all_hr_prompts = expanded_hr_prompts
+        if expanded_hr_negative_prompts is not None:
+            p.all_hr_negative_prompts = expanded_hr_negative_prompts
+
+        p.n_iter = len(batch_ratio_plan)
+        p._arr_plan = batch_ratio_plan
+        p._arr_gallery_sort_keys = []
+
+        if len({(r.antecedent, r.consequent) for r in batch_ratio_plan}) > 1:
             p.do_not_save_grid = True
 
-    def before_process_batch(self, p, enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution, **kwargs):
+        total = len(p.all_prompts)
+        ratio_list = ", ".join(f"{r.antecedent}:{r.consequent}" for r in batch_ratio_plan)
+        print(
+            f"{LOG} {usable_groups} group(s) x {variants} variant(s) x "
+            f"{ratio_count} ratio(s) = {total} image(s) | "
+            f"{p.n_iter} GPU batch(es), GPU batch {p.batch_size}"
+            f"\n{LOG} batch ratio plan: {ratio_list}"
+        )
+
+    def before_process_batch(self, p, enabled, ratios, variants_per_ratio, ratios_per_batch, selection_mode, sort_gallery, **kwargs):
         """Apply this batch's resolution and rebuild the noise to match.
 
         The pipeline builds ``_shape``/``p.rng`` from ``p.width``/``p.height`` just
@@ -310,66 +392,31 @@ class AspectRatioRandomizer(scripts.Script):
             return
 
         batch_number = kwargs.get("batch_number", 0)
-        chunks_per_res = p._arr_chunks_per_res
-        raw_res_index = batch_number // chunks_per_res
-        res_index = raw_res_index
-        chunk_index = batch_number % chunks_per_res
-
-        # Another always-on script (e.g. Dynamic Prompts' Combinatorial generation)
-        # can rewrite p.n_iter in its own `process` after our plan is built — that
-        # would push res_index past the end of the plan. Cycle through the plan
-        # instead of crashing with an IndexError; warn once so it's not a mystery.
         plan_len = len(p._arr_plan)
-        if res_index >= plan_len:
+        if plan_len == 0:
+            return
+
+        plan_index = batch_number
+        if plan_index >= plan_len:
             if not p._arr_overflow_warned:
                 p._arr_overflow_warned = True
                 print(
                     f"{LOG} warning: batch count changed to {p.n_iter} after planning "
-                    f"(expected {plan_len * chunks_per_res}) — cycling the resolution "
+                    f"(expected {plan_len}) — cycling the resolution "
                     f"plan to cover the extra batches"
                 )
-            res_index %= plan_len
+            plan_index %= plan_len
 
-        group_index = raw_res_index // p._arr_group_size
-        group_position = raw_res_index % p._arr_group_size
-        bank_key = (group_index, chunk_index)
-
-        # Reuse each comparison group's variant seeds *and* prompts (by chunk) so
-        # the same seed-and-prompt pairing renders at every aspect ratio in that
-        # group. This also pins wildcard / Dynamic Prompts picks (e.g.
-        # {joe|jeff|john}) across resolutions — without it, only the noise seed
-        # would match while the chosen word could differ per batch. Must happen
-        # before the RNG rebuild (it reads p.seeds).
-        if match_seeds:
-            if group_position == 0 or bank_key not in p._arr_seed_bank:
-                p._arr_seed_bank[bank_key] = list(p.seeds)
-                p._arr_subseed_bank[bank_key] = list(p.subseeds)
-                p._arr_prompt_bank[bank_key] = list(p.prompts)
-                p._arr_neg_prompt_bank[bank_key] = list(p.negative_prompts)
-            else:
-                p.seeds = list(p._arr_seed_bank[bank_key])
-                p.subseeds = list(p._arr_subseed_bank[bank_key])
-                p.prompts = list(p._arr_prompt_bank[bank_key])
-                p.negative_prompts = list(p._arr_neg_prompt_bank[bank_key])
-                bs = p.batch_size
-                lo = batch_number * bs
-                hi = lo + bs
-                p.all_seeds[lo:hi] = p.seeds
-                p.all_subseeds[lo:hi] = p.subseeds
-                p.all_prompts[lo:hi] = p.prompts
-                p.all_negative_prompts[lo:hi] = p.negative_prompts
-
-        ratio = p._arr_plan[res_index]
+        ratio = p._arr_plan[plan_index]
         p.width, p.height = calc_nearest_res_for_ratio(p._arr_base_w, ratio)
 
         # Record the chosen ratio in this batch's image metadata (PNG info / infotext).
         p.extra_generation_params["Aspect ratio"] = f"{ratio.antecedent}:{ratio.consequent}"
 
         if opts.data.get("arr_log_each_batch", True):
-            resolutions = len(p._arr_plan)
             print(
                 f"{LOG} batch {batch_number + 1}/{p.n_iter} | "
-                f"resolution {res_index + 1}/{resolutions} ({ratio.antecedent}:{ratio.consequent}) "
+                f"ratio {plan_index + 1}/{plan_len} ({ratio.antecedent}:{ratio.consequent}) "
                 f"-> {p.width}x{p.height} | seeds {p.seeds}"
             )
 
@@ -380,7 +427,7 @@ class AspectRatioRandomizer(scripts.Script):
         if getattr(p, "enable_hr", False) and hasattr(p, "calculate_target_resolution"):
             p.calculate_target_resolution()
 
-    def postprocess_image_after_composite(self, p, pp, enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution):
+    def postprocess_image_after_composite(self, p, pp, enabled, ratios, variants_per_ratio, ratios_per_batch, selection_mode, sort_gallery):
         if not getattr(p, "_arr_active", False):
             return
 
@@ -397,8 +444,8 @@ class AspectRatioRandomizer(scripts.Script):
             (seed, int(p.width), int(p.height), len(p._arr_gallery_sort_keys))
         )
 
-    def postprocess(self, p, processed, enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution):
-        if not getattr(p, "_arr_active", False):
+    def postprocess(self, p, processed, enabled, ratios, variants_per_ratio, ratios_per_batch, selection_mode, sort_gallery):
+        if not getattr(p, "_arr_active", False) or not getattr(p, "_arr_sort_gallery", True):
             return
 
         sort_keys = getattr(p, "_arr_gallery_sort_keys", [])
@@ -436,6 +483,55 @@ class AspectRatioRandomizer(scripts.Script):
             processed.seed = int(processed.all_seeds[0])
         if first == 0 and processed.all_subseeds:
             processed.subseed = int(processed.all_subseeds[0])
+
+    @staticmethod
+    def _effective_ratio_count(selected: list[AspectRatio], requested: int, mode: str) -> int:
+        requested = max(1, int(requested or 1))
+        if mode == "Random with replacement":
+            return requested
+        return min(requested, len(selected))
+
+    @staticmethod
+    def _largest_divisor_at_most(value: int, maximum: int) -> int:
+        value = max(1, int(value or 1))
+        maximum = max(1, min(int(maximum or 1), value))
+
+        for candidate in range(maximum, 0, -1):
+            if value % candidate == 0:
+                return candidate
+
+        return 1
+
+    @staticmethod
+    def _has_aligned_list(p, attr: str, expected_len: int) -> bool:
+        value = getattr(p, attr, None)
+        return isinstance(value, list) and len(value) == expected_len
+
+    @staticmethod
+    def _select_ratios_for_batch(
+        selected: list[AspectRatio],
+        ratio_count: int,
+        mode: str,
+        batch_index: int,
+    ) -> list[AspectRatio]:
+        if mode == "Selected order":
+            return selected[:ratio_count]
+
+        if mode == "Sequential rotating":
+            return [
+                selected[(batch_index * ratio_count + offset) % len(selected)]
+                for offset in range(ratio_count)
+            ]
+
+        if mode == "Random with replacement":
+            return random.choices(selected, k=ratio_count)
+
+        if ratio_count >= len(selected):
+            ratios = selected[:]
+            random.shuffle(ratios)
+            return ratios
+
+        return random.sample(selected, ratio_count)
 
     @staticmethod
     def _rebuild_rng(p):
