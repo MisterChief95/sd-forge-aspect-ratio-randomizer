@@ -4,14 +4,12 @@ A Stable Diffusion WebUI **always-on extension** that enables random aspect rati
 
 ## Features
 
-- Always-on accordion (like ControlNet/FreeU) — coexists with other scripts; no need to occupy the exclusive `Scripts` dropdown slot
 - Supports common aspect ratios (21:9, 16:9, 3:2, 4:3, 1:1, etc.)
 - Supports custom aspect ratios via Settings menu
 - Automatically adjusts dimensions to the WebUI's Resolution Step (default 64px multiples) to maintain extension compatibility
 - Maintains consistent image quality by preserving total pixel area
 - Renders exact seed/prompt variant counts at multiple aspect ratios, keeping batch size as a GPU parallelism limit
 - Records the chosen ratio in each image's metadata (`Aspect ratio` in PNG info)
-- Works with Wan-format image models (e.g. Anima, Qwen)
 
 ## Settings
 
@@ -111,7 +109,6 @@ taking over the generation loop:
 
 - **Txt2Img only.** It is disabled on img2img (changing the resolution would distort the init image).
 - Resolution is constant within a single GPU batch (it varies across batches), so a given GPU batch can't mix resolutions.
-- The Hires-fix `Use old hires fix width/height` option is not specifically supported and may behave unexpectedly with multiple resolutions.
 - Relies on the pipeline's internal noise-RNG construction; if Forge changes how `p.rng` is built upstream, this extension may need updating.
 - Conflicts with selectable `Scripts` (e.g. Prompt Matrix, X/Y/Z Plot) that take over the generation loop — set the Scripts dropdown to `None` when using this extension.
 - If another always-on script changes the batch count *after* this extension has expanded the plan, the resolution plan is cycled to cover the extra batches — logged once to the console — rather than crashing.
