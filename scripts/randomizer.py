@@ -49,27 +49,29 @@ class Size:
 
 
 def calc_nearest_res_for_ratio(width: int, aspect_ratio: AspectRatio) -> Size:
+    # Follow the WebUI's built-in "Resolution Step" so computed sizes stay valid.
+    pixel_rounding = max(1, int(opts.data.get("res_step", 64) or 64))
+
     if aspect_ratio.ratio == 1:
-        return Size(width, width)
+        square = int(round(float(width) / pixel_rounding) * pixel_rounding)
+        return Size(square, square)
 
     base_area = width * width
 
     if aspect_ratio.ratio > 1:
-        # Scale width for positive ratios
-        new_width = int(math.sqrt(base_area * aspect_ratio.ratio))
-        new_height = int(new_width / aspect_ratio.ratio)
+        # Keep the long edge at or below the ideal size so 1024 SDXL-style
+        # buckets land on common sizes like 1152x896 instead of 1184x896.
+        ideal_width = math.sqrt(base_area * aspect_ratio.ratio)
+        ideal_height = ideal_width / aspect_ratio.ratio
+        new_width = math.floor(ideal_width / pixel_rounding) * pixel_rounding
+        new_height = round(ideal_height / pixel_rounding) * pixel_rounding
     else:
-        # Scale height for negative ratios
-        new_height = int(math.sqrt(base_area / aspect_ratio.ratio))
-        new_width = int(new_height * aspect_ratio.ratio)
+        ideal_height = math.sqrt(base_area / aspect_ratio.ratio)
+        ideal_width = ideal_height * aspect_ratio.ratio
+        new_height = math.floor(ideal_height / pixel_rounding) * pixel_rounding
+        new_width = round(ideal_width / pixel_rounding) * pixel_rounding
 
-    # Follow the WebUI's built-in "Resolution Step" so computed sizes stay valid.
-    pixel_rounding: float = max(1, opts.data.get("res_step", 64))
-
-    new_width = int(round(float(new_width) / pixel_rounding) * pixel_rounding)
-    new_height = int(round(float(new_height) / pixel_rounding) * pixel_rounding)
-
-    return Size(new_width, new_height)
+    return Size(max(pixel_rounding, int(new_width)), max(pixel_rounding, int(new_height)))
 
 
 def parse_aspect_ratio(ratio: str) -> tuple[str, AspectRatio]:
