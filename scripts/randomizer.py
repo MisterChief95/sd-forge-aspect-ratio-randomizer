@@ -126,42 +126,19 @@ class AspectRatioRandomizer(scripts.Script):
         return "Aspect Ratio Randomizer"
 
     def show(self, is_img2img):
-        # Always-on accordion (like ControlNet/FreeU), coexists with other scripts.
-        return scripts.AlwaysVisible
+        return scripts.AlwaysVisible if not is_img2img else False
 
     def ui(self, is_img2img):
         with InputAccordion(
             False, label=self.title(), elem_id="arr-enabled"
         ) as enabled:
-            if is_img2img:
-                gr.Markdown(
-                    "Aspect Ratio Randomizer only affects **txt2img** — changing the "
-                    "resolution mid-run would distort an img2img init image, so it does "
-                    "nothing here."
-                )
-                # Hidden placeholders so the returned arg count stays stable.
-                ratios = gr.CheckboxGroup(
-                    choices=list(ASPECT_RATIOS.keys()), visible=False
-                )
-                clamp_to_resolutions = gr.Checkbox(value=False, visible=False)
-                match_seeds = gr.Checkbox(value=True, visible=False)
-                variants_per_resolution = gr.Slider(
-                    minimum=1, maximum=100, step=1, value=1, visible=False
-                )
-                return [enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution]
-
-            with gr.Row():
-                ratios = gr.CheckboxGroup(
-                    label="Aspect Ratios",
-                    choices=list(ASPECT_RATIOS.keys()),
-                    info="Select the aspect ratios you want to randomize between. Order is: Wide - Square - Tall",
-                )
-
             gr.Markdown(
-                "**Batch count** = number of aspect ratios; **batch size** = max images "
-                "generated concurrently (VRAM). The slider below sets how many variants to "
-                "render per resolution (it can exceed the batch size limit of 8). "
-                "Total images = batch count x variants per resolution."
+                "**Batch count** = number of aspect ratios. "
+                "**Batch size** = max images generated concurrently"
+            )
+            gr.Markdown(
+                "The **Width** setting is used as a base size to compute the others from, "
+                "so pick one that works for all your ratios (e.g. 1024 for SDXL)."
             )
 
             variants_per_resolution = gr.Slider(
@@ -170,20 +147,28 @@ class AspectRatioRandomizer(scripts.Script):
                 step=1,
                 value=1,
                 label="Variants per resolution",
-                info="How many images to render at each resolution. Generated in GPU batches of 'batch size'. Can go higher than the batch size limit.",
+                info="Number of images to generate for each selected aspect ratio",
             )
 
-            match_seeds = gr.Checkbox(
-                value=True,
-                label="Use the same seed across all resolutions",
-                info="Renders the same seed(s) at every aspect ratio so you can compare them directly. Uncheck to let seeds advance normally per batch.",
-            )
+            with gr.Row():
+                match_seeds = gr.Checkbox(
+                    value=True,
+                    label="Use the same seed across all resolutions",
+                    info="Also reuses each variant's exact prompt, so wildcard / "
+                         "Dynamic Prompts picks stay identical across resolutions too",
+                )
 
-            clamp_to_resolutions = gr.Checkbox(
-                value=False,
-                label="Limit batch count to number of selected resolutions",
-                info="When enabled, the batch count is reduced so each selected ratio is used at most once (a message is logged).",
-            )
+                clamp_to_resolutions = gr.Checkbox(
+                    value=False,
+                    label="Limit batch count to number of selected resolutions",
+                )
+
+            with gr.Row():
+                ratios = gr.CheckboxGroup(
+                    label="Aspect Ratios",
+                    choices=list(ASPECT_RATIOS.keys()),
+                    info="Select the aspect ratios you want to randomize between. Order is: Wide - Square - Tall",
+                )
 
             with gr.Row():
                 select_all = gr.Button(value="Select All")
@@ -289,10 +274,18 @@ class AspectRatioRandomizer(scripts.Script):
         p._arr_base_w = p.width
         p._arr_plan = plan
         p._arr_chunks_per_res = chunks_per_res
-        # When matching seeds, each resolution's variant seeds (keyed by chunk index)
-        # are captured during the first resolution and reused for the rest.
-        p._arr_seed_bank: dict[int, list] = {}
-        p._arr_subseed_bank: dict[int, list] = {}
+        p._arr_overflow_warned = False
+        # When matching seeds, each comparison group's variant seeds *and* prompts
+        # (keyed by group and chunk index) are captured during the first resolution
+        # in that group and reused for the rest. This also pins wildcard / Dynamic
+        # Prompts picks across resolutions without forcing later groups to cycle
+        # back to the first group's seeds.
+        p._arr_group_size = max(1, min(len(selected), resolutions))
+        p._arr_seed_bank = {}
+        p._arr_subseed_bank = {}
+        p._arr_prompt_bank = {}
+        p._arr_neg_prompt_bank = {}
+        p._arr_gallery_sort_keys = []
 
         total = p.n_iter * p.batch_size
         ratio_list = ", ".join(f"{r.antecedent}:{r.consequent}" for r in plan)
@@ -318,23 +311,53 @@ class AspectRatioRandomizer(scripts.Script):
 
         batch_number = kwargs.get("batch_number", 0)
         chunks_per_res = p._arr_chunks_per_res
-        res_index = batch_number // chunks_per_res
+        raw_res_index = batch_number // chunks_per_res
+        res_index = raw_res_index
         chunk_index = batch_number % chunks_per_res
 
-        # Reuse each resolution's variant seeds (by chunk) so the same seeds render at
-        # every aspect ratio. Must happen before the RNG rebuild (it reads p.seeds).
+        # Another always-on script (e.g. Dynamic Prompts' Combinatorial generation)
+        # can rewrite p.n_iter in its own `process` after our plan is built — that
+        # would push res_index past the end of the plan. Cycle through the plan
+        # instead of crashing with an IndexError; warn once so it's not a mystery.
+        plan_len = len(p._arr_plan)
+        if res_index >= plan_len:
+            if not p._arr_overflow_warned:
+                p._arr_overflow_warned = True
+                print(
+                    f"{LOG} warning: batch count changed to {p.n_iter} after planning "
+                    f"(expected {plan_len * chunks_per_res}) — cycling the resolution "
+                    f"plan to cover the extra batches"
+                )
+            res_index %= plan_len
+
+        group_index = raw_res_index // p._arr_group_size
+        group_position = raw_res_index % p._arr_group_size
+        bank_key = (group_index, chunk_index)
+
+        # Reuse each comparison group's variant seeds *and* prompts (by chunk) so
+        # the same seed-and-prompt pairing renders at every aspect ratio in that
+        # group. This also pins wildcard / Dynamic Prompts picks (e.g.
+        # {joe|jeff|john}) across resolutions — without it, only the noise seed
+        # would match while the chosen word could differ per batch. Must happen
+        # before the RNG rebuild (it reads p.seeds).
         if match_seeds:
-            if res_index == 0:
-                p._arr_seed_bank[chunk_index] = list(p.seeds)
-                p._arr_subseed_bank[chunk_index] = list(p.subseeds)
+            if group_position == 0 or bank_key not in p._arr_seed_bank:
+                p._arr_seed_bank[bank_key] = list(p.seeds)
+                p._arr_subseed_bank[bank_key] = list(p.subseeds)
+                p._arr_prompt_bank[bank_key] = list(p.prompts)
+                p._arr_neg_prompt_bank[bank_key] = list(p.negative_prompts)
             else:
-                p.seeds = list(p._arr_seed_bank[chunk_index])
-                p.subseeds = list(p._arr_subseed_bank[chunk_index])
+                p.seeds = list(p._arr_seed_bank[bank_key])
+                p.subseeds = list(p._arr_subseed_bank[bank_key])
+                p.prompts = list(p._arr_prompt_bank[bank_key])
+                p.negative_prompts = list(p._arr_neg_prompt_bank[bank_key])
                 bs = p.batch_size
                 lo = batch_number * bs
                 hi = lo + bs
                 p.all_seeds[lo:hi] = p.seeds
                 p.all_subseeds[lo:hi] = p.subseeds
+                p.all_prompts[lo:hi] = p.prompts
+                p.all_negative_prompts[lo:hi] = p.negative_prompts
 
         ratio = p._arr_plan[res_index]
         p.width, p.height = calc_nearest_res_for_ratio(p._arr_base_w, ratio)
@@ -356,6 +379,63 @@ class AspectRatioRandomizer(scripts.Script):
         # for this batch's base resolution.
         if getattr(p, "enable_hr", False) and hasattr(p, "calculate_target_resolution"):
             p.calculate_target_resolution()
+
+    def postprocess_image_after_composite(self, p, pp, enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution):
+        if not getattr(p, "_arr_active", False):
+            return
+
+        batch_index = getattr(p, "batch_index", 0)
+        if batch_index >= len(getattr(p, "seeds", [])):
+            return
+
+        try:
+            seed = int(p.seeds[batch_index])
+        except (TypeError, ValueError):
+            seed = 0
+
+        p._arr_gallery_sort_keys.append(
+            (seed, int(p.width), int(p.height), len(p._arr_gallery_sort_keys))
+        )
+
+    def postprocess(self, p, processed, enabled, ratios, clamp_to_resolutions, match_seeds, variants_per_resolution):
+        if not getattr(p, "_arr_active", False):
+            return
+
+        sort_keys = getattr(p, "_arr_gallery_sort_keys", [])
+        first = getattr(processed, "index_of_first_image", 0)
+        sortable_count = len(sort_keys)
+
+        if sortable_count <= 1:
+            return
+
+        if len(processed.images) < first + sortable_count or len(processed.infotexts) < first + sortable_count:
+            print(
+                f"{LOG} warning: gallery sort skipped because the processed image "
+                f"count did not match the generated image count"
+            )
+            return
+
+        order = sorted(range(sortable_count), key=lambda i: sort_keys[i])
+
+        def reorder_slice(values):
+            values[first:first + sortable_count] = [
+                values[first + i] for i in order
+            ]
+
+        reorder_slice(processed.images)
+        reorder_slice(processed.infotexts)
+
+        for attr in ("all_prompts", "all_negative_prompts", "all_seeds", "all_subseeds"):
+            values = getattr(processed, attr, None)
+            if isinstance(values, list) and len(values) >= first + sortable_count:
+                reorder_slice(values)
+
+        if processed.infotexts:
+            processed.info = processed.infotexts[0]
+        if first == 0 and processed.all_seeds:
+            processed.seed = int(processed.all_seeds[0])
+        if first == 0 and processed.all_subseeds:
+            processed.subseed = int(processed.all_subseeds[0])
 
     @staticmethod
     def _rebuild_rng(p):

@@ -67,10 +67,21 @@ reshuffled and reused.
 
 ### Use the same seed across all resolutions
 
-Enabled by default. The first resolution's variant seeds are captured and reused
-for every later resolution, so each variant is rendered with the same seed at every
-aspect ratio (handy for comparing how a given seed looks across ratios). Uncheck
-this to let seeds advance normally so each resolution gets fresh variants.
+Enabled by default. Each comparison group's first resolution captures its variant
+seeds **and prompts**, then reuses them for the other resolutions in that group,
+so each variant renders with an identical seed-and-prompt pairing at every aspect
+ratio — a true side-by-side comparison. When batch count exceeds the number of
+selected ratios, the next pass starts a fresh seed/prompt group instead of cycling
+back to the first one. This also pins **wildcard / Dynamic Prompts** picks (e.g.
+`{joe|jeff|john}` or `__characters__`) so the same word is chosen at every
+resolution instead of being re-rolled per batch (each batch is a different slice
+of the generated prompt list, so without this the seed would match but the chosen
+word generally wouldn't). Uncheck this to let both seeds and prompts advance
+normally so each resolution gets fresh variants.
+
+At the end of generation, the returned gallery is sorted by seed, then by
+resolution (`width x height`) so same-seed / same-prompt comparisons are grouped
+together.
 
 ### Limit batch count to number of selected resolutions
 
@@ -98,3 +109,4 @@ taking over the generation loop:
 - The Hires-fix `Use old hires fix width/height` option is not specifically supported and may behave unexpectedly with multiple resolutions.
 - Relies on the pipeline's internal noise-RNG construction; if Forge changes how `p.rng` is built upstream, this extension may need updating.
 - Conflicts with selectable `Scripts` (e.g. Prompt Matrix, X/Y/Z Plot) that take over the generation loop — set the Scripts dropdown to `None` when using this extension.
+- If another always-on script changes the batch count *after* this extension has planned it (notably **Dynamic Prompts'** *Combinatorial generation*, which can rewrite `p.n_iter` to fit its own combination count), the resolution plan is cycled to cover the extra batches — logged once to the console — rather than crashing. The extra batches reuse earlier ratios rather than getting a freshly shuffled plan.
