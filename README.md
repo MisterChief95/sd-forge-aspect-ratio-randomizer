@@ -1,6 +1,6 @@
 # Aspect Ratio Randomizer
 
-A Stable Diffusion WebUI Forge Neo that enables random aspect ratio generation while maintaining consistent image area.
+A Stable Diffusion WebUI Forge Neo extension that enables random aspect ratio generation while maintaining consistent image area.
 
 ## Features
 
