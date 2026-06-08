@@ -2,6 +2,8 @@
 
 A Stable Diffusion WebUI Forge Neo extension that enables random aspect ratio generation while maintaining consistent image area.
 
+<img width="811" height="728" alt="image" src="https://github.com/user-attachments/assets/a5a8f143-68db-454b-8c8f-03a0b0503363" />
+
 ## Features
 
 - Supports common aspect ratios (21:9, 16:9, 3:2, 4:3, 1:1, etc.)
